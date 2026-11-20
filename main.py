@@ -1,20 +1,27 @@
 """Forecast GTA VI PS5 trophy earn rates on Exophase at a case's target time.
 
-Model (v1): for every trophy, work with the logit of its earn rate (percent)
-against x = ln(1 + hours since release). A weighted least-squares line is
-fitted to the trophy's whole recorded history; its slope is shrunk toward the
-pooled slope of its tier (platinum/gold/silver/bronze) and toward the global
-pooled slope, with the shrinkage weight driven by how much the trophy's own
-fit can be trusted (span of x covered, residual scatter, number of distinct
-levels seen). The forecast is anchored at the trophy's recent level -- a
-player-count-weighted average of the logit rates of its latest reads -- and
-carried forward along the shrunk slope to the target, rather than reading a
-fitted intercept far outside the data.
+Model (v2, tuned on synthetic launch-week backtests in dev/backtest.py):
 
-The spread around the median combines a floor (a refresh of the page can
-move every rate between two reads), a random-walk term growing with the
-square root of the horizon in days, the trophy's own residual scatter, and
-the slope's standard error projected over the extrapolation distance.
+For every trophy, work with the logit of its earn rate (percent) against
+x = ln(1 + hours since release). Only the last 18 hours of reads are fitted:
+older reads describe a launch regime (a smaller, keener player base, a page
+that had barely begun to refresh) that no longer drives the rates. A
+weighted least-squares line is fitted per trophy -- weights grow with the
+players tracked (less counting noise) and with recency -- and its slope is
+shrunk toward a pooled slope (its tier's, blended with the global pool) by
+an information weight, so a trophy whose own reads are few, flat or noisy
+borrows the field's trajectory instead of extrapolating its own jitter.
+
+The forecast median is anchored at the trophy's recent level (a weighted
+average of the logit rates of its latest reads) and carried to the target
+along the shrunk slope, with the extrapolated move damped by 0.85: a line
+fitted on 18 hours is an optimistic guide to the next 108, and pinball loss
+punishes an overshot median at both ends.
+
+The spread combines a floor (a refresh of the page can move every rate
+between two reads), a random-walk term growing with the square root of the
+horizon in days, a share of the trophy's residual scatter around its fit,
+and the slope's standard error projected over the extrapolation distance.
 Quantiles are the median shifted by z_tau * sigma on the logit scale.
 
 Run by the grader as `python3 -P -s /bot/main.py` (Python 3.13, standard
@@ -26,7 +33,7 @@ import json
 import math
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -40,15 +47,15 @@ Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.644853
 RATE_LO = 0.01
 RATE_HI = 99.99
 
-# Spread ingredients (logit units).
-SIGMA_FLOOR = 0.45        # a page refresh can jump every rate at once
-SIGMA_RW = 0.45           # random-walk scale per sqrt(horizon day)
-RESID_WEIGHT = 0.8        # how much of a trophy's residual scatter to carry
-SLOPE_ERR_WEIGHT = 1.0    # slope standard error projected to the target
+WINDOW_HOURS = 18.0       # fit only the recent regime
+DAMP = 0.85               # shrink the extrapolated move toward the anchor
+SHRINK_PRIOR_N = 2.0      # slope shrinkage strength toward the pooled slope
 
-# Slope shrinkage: trust the trophy's own slope in proportion to the
-# information behind it.
-SHRINK_PRIOR_N = 6.0
+# Spread ingredients (logit units).
+SIGMA_FLOOR = 0.30        # a page refresh can jump every rate at once
+SIGMA_RW = 0.40           # random-walk scale per sqrt(horizon day)
+RESID_WEIGHT = 0.4        # share of a trophy's residual scatter to carry
+SLOPE_ERR_WEIGHT = 1.0    # slope standard error projected to the target
 
 
 def clamp_rate(pct):
@@ -73,11 +80,8 @@ def round4(x):
 
 
 def parse_time(text):
+    from datetime import datetime
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
-
-
-def hours_between(a, b):
-    return (b - a).total_seconds() / 3600.0
 
 
 class TrophyFit:
@@ -113,18 +117,18 @@ def fit_trophy(xs, ys, ws):
         fit.slope = sxy / sxx
         intercept = my - fit.slope * mx
         resid = [y - (intercept + fit.slope * x) for x, y in zip(xs, ys)]
-        dof = max(1.0, sw - 2.0)
-        var = sum(w * r * r for r, w in zip(resid, ws)) / dof
+        dof = max(1.0, float(n) - 2.0)
+        var = sum(w * r * r for r, w in zip(resid, ws)) / dof * (sw / n)
         fit.resid_sd = math.sqrt(max(var, 0.0))
         fit.se_slope = math.sqrt(max(var, 0.0) / sxx)
     else:
         resid = [y - my for y in ys]
-        fit.resid_sd = math.sqrt(sum(w * r * r for r, w in zip(resid, ws)) / max(1.0, sw))
+        fit.resid_sd = math.sqrt(sum(w * r * r for r, w in zip(resid, ws)) / max(1.0, float(n)))
     # Information behind the slope: x-span covered, discounted by scatter.
     span = (max(xs) - min(xs)) if n > 1 else 0.0
     fit.info = span / (0.35 + fit.resid_sd)
-    # Anchor: player-weighted mean of the logit rates over the last stretch
-    # of reads (the final quarter, at least the last three).
+    # Anchor: weighted mean of the logit rates over the last stretch of
+    # fitted reads (the final quarter, at least the last three).
     k = max(3, (n + 3) // 4)
     tail_x = xs[-k:]
     tail_y = ys[-k:]
@@ -155,23 +159,32 @@ def forecast_case(case):
         raise ValueError("no history")
     trophies = case["trophies"]
 
-    release = parse_time(case["game"]["release_date"] + "T00:00:00Z") \
-        if case.get("game", {}).get("release_date") else parse_time(history[0]["at"])
+    game = case.get("game") or {}
+    if game.get("release_date"):
+        release = parse_time(game["release_date"] + "T00:00:00Z")
+    else:
+        release = parse_time(history[0]["at"])
+    checkpoint = parse_time(case["at"])
     target = parse_time(case["target"])
-    x_target = math.log1p(max(0.0, hours_between(release, target)))
+    x_target = math.log1p(max(0.0, (target - release).total_seconds() / 3600.0))
     horizon_days = case["horizon_minutes"] / 1440.0
 
     times = [parse_time(r["at"]) for r in history]
-    xs_all = [math.log1p(max(0.0, hours_between(release, t))) for t in times]
+    xs_all = [math.log1p(max(0.0, (t - release).total_seconds() / 3600.0)) for t in times]
     players = [max(1, int(r.get("players_tracked") or 1)) for r in history]
     p_last = players[-1]
+
+    window_start = checkpoint - timedelta(hours=WINDOW_HOURS)
+    keep = [j for j in range(len(history)) if times[j] >= window_start]
+    if len(keep) < 3:
+        keep = list(range(max(0, len(history) - 8), len(history)))
 
     fits = []
     for i in range(len(trophies)):
         xs, ys, ws = [], [], []
         n_reads = len(history)
-        for j, read in enumerate(history):
-            rate = read["rates"][i]
+        for j in keep:
+            rate = history[j]["rates"][i]
             if rate is None:
                 continue
             # Weight: more players tracked -> less counting noise; later
@@ -208,7 +221,7 @@ def forecast_case(case):
             + 0.35 * global_slope
         slope = lam * f.slope + (1.0 - lam) * pool
         dx = x_target - f.anchor_x
-        median = f.anchor_logit + slope * dx
+        median = f.anchor_logit + DAMP * slope * dx
         median = min(logit(RATE_HI), max(logit(RATE_LO), median))
         sigma = math.sqrt(
             SIGMA_FLOOR ** 2
